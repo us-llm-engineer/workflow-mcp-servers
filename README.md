@@ -127,7 +127,7 @@ Deep dive: [`colab-proxy-mcp/IMPLEMENTATION.md`](colab-proxy-mcp/IMPLEMENTATION.
 ### What it is for
 Give an agent a real cloud machine on demand: CPU-only or GPU (T4 up to B200), with either one-shot commands or a **persistent Jupyter kernel** whose variables survive between calls, plus file transfer and a small notebook-cell API. It is designed for quick feasibility experiments and heavy notebook cells, with **per-second billing treated as a first-class concern**.
 
-### What it can do (28 tools)
+### What it can do (32 tools)
 | Group | Tools and parameters |
 | --- | --- |
 | Account | `modal_check_auth()` verifies credentials with a live, free call. `modal_list_apps()` shows every Modal app on the account (live/stopped). `modal_stop_app(app_identifier, confirm)` kills an app and everything under it. |
@@ -135,14 +135,15 @@ Give an agent a real cloud machine on demand: CPU-only or GPU (T4 up to B200), w
 | Running code | `modal_run_code(handle, code, timeout=120)` (fresh `python -c` each call); `modal_run_shell(handle, args, timeout)` (argv list, no shell: use `["bash","-c","a \| b"]` for pipes); `modal_pip_install(handle, packages, timeout=300)`; `modal_sync_files(handle, files, direction="download"\|"upload")` copies `[remote, local]` pairs with per-pair results. |
 | Persistent kernels | `modal_create_jupyter_kernel(gpu, pip_packages, timeout, idle_timeout, app_name, confirm)`; `modal_run_in_kernel(handle, code)` returns `stdout`, `stderr`, `result`, and structured `error`; `modal_list_kernels()`; `modal_stop_jupyter_kernel(handle, confirm)`; `modal_change_kernel_gpu(handle, gpu, timeout, idle_timeout, confirm)` swaps hardware under the same handle (state is lost, stored cells survive). |
 | Notebook cells | `modal_add_code_cell(handle, code, cell_index)`, `modal_add_text_cell(handle, content, cell_index)`, `modal_get_cells`, `modal_run_cell(handle, cell_id)`, `modal_update_cell`, `modal_delete_cell`, `modal_move_cell`. Same vocabulary as the Colab server so a workflow can target either. |
-| Presets | `host_cpu_sandbox(scaling_factor)` (cores = 0.125 x factor, 0.125-16), `host_one_low_tier_gpu(gpu="T4"\|"L4"\|"A10G")`, `host_two_t4()`, `host_one_high_end_gpu(gpu="L40S"\|"A100"\|"H100"\|"H200"\|"B200")`; each boots a kernel-capable sandbox, so every execution and cell tool works on its handle. |
+| Infrastructure hosting | `host_infra_sandbox(cpu_cores=2, memory_mib=4096, apt_packages, encrypted_ports, timeout=3600, idle_timeout=900, app_name, confirm)` starts a **VM-runtime** sandbox running `dockerd` with `docker compose` installed, so a compose stack can run (default gVisor sandboxes cannot; needs Modal client >= 1.6.0, no GPU); `modal_upload_dir(handle, local_dir, remote_dir, exclude, include_secrets=False, max_mib=256)` uploads a project tree as one archive and skips secrets, `.git`, virtualenvs and caches by default; `modal_docker_status(handle)` lists containers, per-container memory and disk; `modal_sandbox_tunnels(handle)` lists public URLs of exposed ports. The `confirm=True` refusal states an hourly cost estimate. Details: [modal-gpu/README.md](modal-gpu/README.md#hosting-infrastructure-docker-on-the-vm-runtime). |
+| Presets | `host_cpu_sandbox(scaling_factor, memory_mib)` (cores = 0.125 x factor, 0.125-16; `memory_mib` optional, Modal's default is 128 MiB), `host_one_low_tier_gpu(gpu="T4"\|"L4"\|"A10G")`, `host_two_t4()`, `host_one_high_end_gpu(gpu="L40S"\|"A100"\|"H100"\|"H200"\|"B200")`; each boots a kernel-capable sandbox, so every execution and cell tool works on its handle. |
 
 Cost guard rails: create/terminate/switch tools require `confirm=True` and the server instructions tell the agent to state the GPU and hourly rate and get consent first; defaults are 10 minutes lifetime and 2 minutes idle; a failed Jupyter boot terminates its own sandbox; GPU names are validated locally. Jupyter URLs and tokens are never meant to be echoed.
 
 Typical prompts: "Spin up a T4 kernel, train this small CNN for 3 epochs and print validation accuracy, then terminate it"; "Switch the kernel to an L40S and rerun the stored cells"; "List Modal apps and stop anything still running".
 
 ### Set up on a new machine
-1. `pip install mcp modal websocket-client` (the last is only for kernel tools). Python 3.10+.
+1. `pip install 'mcp>=1.2' 'modal>=1.6.0' websocket-client` (websocket-client is only for kernel tools; `modal>=1.6.0` only for `host_infra_sandbox`). Python 3.10+.
 2. Create a Modal account, then authenticate: `modal setup` (writes `~/.modal.toml`) **or** set `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` from a service-user token (Modal dashboard -> Settings -> Tokens). Env vars are the right choice for CI or a headless host.
 3. Register: `python3 /ABS/PATH/modal-gpu/modal_server.py` (stdio).
 4. Verify: call `modal_check_auth` (free), then a short `host_cpu_sandbox` with `confirm=True` and `modal_run_shell(["nvidia-smi"])` style checks, then terminate.

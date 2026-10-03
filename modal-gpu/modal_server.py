@@ -95,17 +95,26 @@ confirm=True, and short, cost-conscious defaults (10 min hard timeout, 2 min
 idle timeout) so a forgotten sandbox can't run away and rack up charges.
 """
 
+import fnmatch
+import inspect
 import json
 import os
+import re
 import secrets as pysecrets
+import shlex
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 import urllib.request
 import uuid
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # mcp >= 2 renamed FastMCP to MCPServer; same constructor, @tool() decorator and run()
+    from mcp.server.mcpserver import MCPServer as FastMCP
 
 try:
     import modal
@@ -160,7 +169,22 @@ SERVER_INSTRUCTIONS = (
     "modal_create_gpu_sandbox or modal_create_jupyter_kernel for the same "
     "resource shape. Fall back to modal_create_jupyter_kernel directly only "
     "for something a host_* tool doesn't cover (e.g. a multi-GPU non-T4 "
-    "request like 'A100:4')."
+    "request like 'A100:4'). To HOST INFRASTRUCTURE (a docker-compose stack: "
+    "databases, brokers, query engines, proxies) use host_infra_sandbox -- a "
+    "VM-runtime sandbox with dockerd running, because the default gVisor "
+    "sandboxes of every other tool cannot run Docker Compose (needs Modal "
+    "client >= 1.6.0; GPUs are not available on it). It requires an explicit "
+    "memory_mib (Modal's default is 128 MiB) and its confirm=True refusal "
+    "message states the estimated hourly cost (about $0.142 per core-hour plus "
+    "$0.024 per GiB-hour, a floor because Modal bills the higher of request "
+    "and usage): relay that figure and get the user's go-ahead in this turn. "
+    "Then modal_upload_dir (secrets, .git, virtualenvs and keys are excluded "
+    "by default; never pass include_secrets=True without the user's explicit "
+    "approval), modal_run_shell([\"docker\",\"compose\",...], timeout=...) with "
+    "a long timeout, modal_docker_status to see containers and memory, "
+    "modal_sandbox_tunnels for public URLs, modal_sync_files to fetch results, "
+    "and modal_terminate_sandbox(confirm=True) the moment the run is done. "
+    "host_cpu_sandbox also accepts memory_mib for non-Docker CPU work."
 )
 
 mcp = FastMCP("modal-gpu", instructions=SERVER_INSTRUCTIONS)
@@ -195,6 +219,46 @@ MAX_HOST_CPU_CORES = 16.0
 
 JUPYTER_PORT = 8888
 JUPYTER_BOOT_TIMEOUT = 60  # seconds to wait for the Jupyter server to come up
+
+# --- Infrastructure hosting (VM runtime + Docker) ---------------------------
+# Modal's default Sandbox runtime is gVisor, which cannot give Docker the
+# virtual network pairs and NAT it needs, so `docker compose` services cannot
+# reach each other there. The VM runtime (`runtime="vm"`, Modal client >= 1.6.0)
+# runs the Sandbox in its own Linux kernel; Modal's guide for running Docker in
+# a Sandbox (https://modal.com/docs/guide/docker-in-sandboxes) starts `dockerd`
+# as the entrypoint and runs containers with sandbox.exec(). GPUs are only
+# available on the gVisor runtime, so host_infra_sandbox is CPU-only.
+MIN_VM_RUNTIME_MODAL_VERSION = (1, 6, 0)
+INFRA_BASE_IMAGE = "ubuntu:24.04"
+# docker.io + the compose v2 plugin from Ubuntu's own archive; python-is-python3
+# so modal_run_code (which execs `python`) works on this image.
+INFRA_APT_PACKAGES = ["docker.io", "docker-compose-v2", "curl", "ca-certificates", "git",
+                      "python3", "python-is-python3", "rsync"]
+INFRA_DEFAULT_CPU = 2.0
+INFRA_DEFAULT_MEMORY_MIB = 4096
+INFRA_MIN_MEMORY_MIB = 512
+# Guard rails of THIS server (Modal enforces its own maximum at creation time
+# but does not publish the number): keep an agent from requesting an unbounded
+# machine by mistake.
+INFRA_MAX_CPU = 16.0
+INFRA_MAX_MEMORY_MIB = 32768
+INFRA_DEFAULT_TIMEOUT = 3600      # 1 h hard cap; Modal allows up to 24 h
+INFRA_MAX_TIMEOUT = 86400
+INFRA_DEFAULT_IDLE_TIMEOUT = 900  # exec() activity resets it
+INFRA_READY_TIMEOUT = 300         # seconds to wait for dockerd to answer `docker info`
+INFRA_MAX_PORTS = 8
+
+# Modal's published Sandbox + Notebooks compute rates (https://modal.com/pricing,
+# read 2026-10-03): $0.00003942 per core-second and $0.00000667 per GiB-second.
+# Billing is per second on the higher of the request and the actual usage, so the
+# estimate below is a floor, not a cap.
+CPU_PRICE_PER_CORE_HOUR = 0.00003942 * 3600
+MEM_PRICE_PER_GIB_HOUR = 0.00000667 * 3600
+
+# Files that must not leave the machine by default when a directory is uploaded.
+DEFAULT_UPLOAD_EXCLUDES = [".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+                           ".mypy_cache", ".env", ".env.local", ".tls", "*.pem", "*.key", "*.sqlite"]
+DEFAULT_UPLOAD_MAX_MIB = 256
 
 # In-memory registry: short handle -> {"sandbox": Sandbox, "gpu":.., "created": ts, "app_name":..}
 _SANDBOXES: dict = {}
@@ -273,6 +337,107 @@ def _confirm_required(action: str) -> dict:
         "error": f"confirm must be True to {action} -- this creates/destroys billable "
                  f"cloud resources. Get the user's explicit, in-chat confirmation first.",
     }
+
+
+def _modal_version_tuple() -> tuple:
+    """The installed Modal client version as a comparable tuple, e.g. (1, 6, 0).
+    Dev/pre-release suffixes are ignored; an unparsable version gives (0,)."""
+    raw = getattr(modal, "__version__", "") if modal is not None else ""
+    parts = []
+    for piece in str(raw).split("."):
+        m = re.match(r"\d+", piece)
+        if not m:
+            break
+        parts.append(int(m.group(0)))
+    return tuple(parts) or (0,)
+
+
+def _require_vm_runtime() -> Optional[dict]:
+    """The VM runtime needs `runtime=` on Sandbox.create, which only exists in
+    Modal client >= 1.6.0 (1.5.x has no such argument). Check the actual
+    signature as well as the version string so a future rename fails here,
+    with an explanation, instead of as an opaque TypeError."""
+    err = _require_modal()
+    if err:
+        return err
+    have = _modal_version_tuple()
+    try:
+        has_runtime = "runtime" in inspect.signature(modal.Sandbox.create).parameters
+    except (TypeError, ValueError):
+        has_runtime = False
+    if have < MIN_VM_RUNTIME_MODAL_VERSION or not has_runtime:
+        want = ".".join(str(x) for x in MIN_VM_RUNTIME_MODAL_VERSION)
+        return {
+            "ok": False,
+            "error": f"The installed Modal client ({getattr(modal, '__version__', 'unknown')}) cannot create "
+                     f"VM-runtime Sandboxes, which Docker needs (gVisor Sandboxes cannot run Docker Compose). "
+                     f"Run: pip install -U 'modal>={want}'",
+        }
+    return None
+
+
+def _estimate_hourly_cost(cpu_cores: float, memory_mib: int) -> float:
+    """Floor of the hourly cost in USD from Modal's published Sandbox rates.
+    Modal bills the higher of the request and actual usage per second, so real
+    cost can be higher when the workload bursts above the request."""
+    return cpu_cores * CPU_PRICE_PER_CORE_HOUR + (memory_mib / 1024.0) * MEM_PRICE_PER_GIB_HOUR
+
+
+def _upload_excluded(rel_path: str, patterns: list) -> bool:
+    """True when any path component, or the whole relative path, matches one of
+    the glob patterns (so `.git` skips the whole tree and `*.key` skips any key
+    file at any depth)."""
+    parts = rel_path.replace(os.sep, "/").split("/")
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat) or any(fnmatch.fnmatch(p, pat) for p in parts):
+            return True
+    return False
+
+
+def _build_tarball(local_dir: str, patterns: list, max_bytes: int):
+    """Pack local_dir into a temporary .tar.gz, skipping excluded paths.
+    Returns (tar_path, files, uncompressed_bytes, skipped). The caller deletes
+    tar_path. Raises ValueError for a missing directory or an oversized tree,
+    before anything leaves the machine."""
+    root = os.path.abspath(os.path.expanduser(local_dir))
+    if not os.path.isdir(root):
+        raise ValueError(f"local_dir '{local_dir}' is not a directory.")
+    files = skipped = total = 0
+    fd, tar_path = tempfile.mkstemp(suffix=".tar.gz", prefix="modal-upload-")
+    os.close(fd)
+    try:
+        with tarfile.open(tar_path, "w:gz") as tar:
+            for dirpath, dirnames, filenames in os.walk(root):
+                rel_dir = os.path.relpath(dirpath, root)
+                keep = []
+                for d in dirnames:
+                    rel = d if rel_dir == "." else os.path.join(rel_dir, d)
+                    if _upload_excluded(rel, patterns):
+                        skipped += 1
+                    else:
+                        keep.append(d)
+                dirnames[:] = keep
+                for name in filenames:
+                    rel = name if rel_dir == "." else os.path.join(rel_dir, name)
+                    full = os.path.join(dirpath, name)
+                    if _upload_excluded(rel, patterns) or os.path.islink(full):
+                        skipped += 1
+                        continue
+                    size = os.path.getsize(full)
+                    total += size
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"'{local_dir}' exceeds the {max_bytes // (1024 * 1024)} MiB upload limit "
+                            f"(after exclusions). Add exclude patterns or raise max_mib.")
+                    tar.add(full, arcname=rel, recursive=False)
+                    files += 1
+    except Exception:
+        try:
+            os.remove(tar_path)
+        except OSError:
+            pass
+        raise
+    return tar_path, files, total, skipped
 
 
 def _drain(stream) -> str:
@@ -426,7 +591,8 @@ class _JupyterKernelClient:
 
 def _boot_jupyter_sandbox(gpu_arg: Optional[str], pip_packages: Optional[list],
                            app_name: str, timeout: int, idle_timeout: int,
-                           cpu: Optional[float] = None):
+                           cpu: Optional[float] = None,
+                           memory: Optional[int] = None):
     """Create a Sandbox running `jupyter notebook` as its main process,
     wait for it to come up, and connect a _JupyterKernelClient. Shared by
     modal_create_jupyter_kernel, modal_change_kernel_gpu, and every host_*
@@ -435,6 +601,9 @@ def _boot_jupyter_sandbox(gpu_arg: Optional[str], pip_packages: Optional[list],
     place. cpu is an explicit CPU-core request/limit passed straight to
     Sandbox.create(cpu=...) -- leave it None to fall back to Modal's own
     default (0.125 cores) exactly like every existing caller already does.
+    memory is an explicit memory request in MiB passed to Sandbox.create(memory=...)
+    -- None keeps Modal's default (128 MiB), which is far too little for most
+    real workloads.
     Returns (sandbox, kernel, server_url, token) on success, or
     (None, None, error_dict, None) on failure -- any sandbox created before
     the failure is already terminated by this function, so callers never
@@ -458,6 +627,7 @@ def _boot_jupyter_sandbox(gpu_arg: Optional[str], pip_packages: Optional[list],
             image=image,
             gpu=gpu_arg,
             cpu=cpu,
+            memory=memory,
             timeout=timeout,
             idle_timeout=idle_timeout,
             encrypted_ports=[JUPYTER_PORT],
@@ -1428,6 +1598,297 @@ def _register_jupyter_sandbox(sandbox, kernel, server_url: str, token: str, gpu_
 
 
 # ---------------------------------------------------------------------------
+# Infrastructure hosting: a VM-runtime Sandbox running dockerd. Use this to
+# host a docker-compose stack (databases, brokers, query engines, proxies);
+# the default gVisor Sandboxes used by every other tool here cannot run it.
+# ---------------------------------------------------------------------------
+
+_APT_NAME = re.compile(r"^[a-z0-9][a-z0-9+.\-]*$")
+
+
+def _exec_capture(sandbox, args: list, timeout: int) -> dict:
+    """Run argv in the sandbox and return {returncode, stdout, stderr}."""
+    process = sandbox.exec(*args, timeout=timeout)
+    stdout = _drain(process.stdout)
+    stderr = _drain(process.stderr)
+    returncode = process.wait()
+    return {"returncode": returncode, "stdout": stdout.strip(), "stderr": stderr.strip()}
+
+
+@mcp.tool()
+def host_infra_sandbox(
+    cpu_cores: float = INFRA_DEFAULT_CPU,
+    memory_mib: int = INFRA_DEFAULT_MEMORY_MIB,
+    apt_packages: Optional[list] = None,
+    encrypted_ports: Optional[list] = None,
+    timeout: int = INFRA_DEFAULT_TIMEOUT,
+    idle_timeout: int = INFRA_DEFAULT_IDLE_TIMEOUT,
+    app_name: str = DEFAULT_APP_NAME,
+    confirm: bool = False,
+) -> dict:
+    """Create a live, billable, GPU-FREE Modal VM sandbox that runs Docker
+    (dockerd as the main process, `docker` and `docker compose` installed),
+    for hosting infrastructure such as a compose stack. Why a VM: the default
+    gVisor sandboxes cannot give Docker container networking, so compose
+    services could not reach each other; Modal's VM runtime has its own Linux
+    kernel and can (https://modal.com/docs/guide/docker-in-sandboxes).
+    Requires Modal client >= 1.6.0 (checked; the error says how to upgrade).
+    cpu_cores: 0.125-16 (default 2). memory_mib: 512-32768 (default 4096) --
+    memory is requested explicitly because Modal's default is only 128 MiB.
+    apt_packages: extra Ubuntu packages baked into the image (adds billed
+    boot time). encrypted_ports: TCP ports to expose over TLS tunnels (at most
+    8); the returned `tunnels` map has the public URL for each -- tunnel
+    support on the VM runtime is not documented by Modal, so the response
+    reports honestly if a tunnel could not be read. timeout: hard lifetime cap
+    in seconds (default 3600, max 86400); idle_timeout resets on exec()
+    activity (default 900) and is a safety net, not a substitute for
+    modal_terminate_sandbox. GPUs are not available on this runtime.
+    Typical flow: host_infra_sandbox -> modal_upload_dir (the stack's files)
+    -> modal_run_shell(["docker","compose",...], timeout=...) ->
+    modal_docker_status -> collect results with modal_sync_files ->
+    modal_terminate_sandbox. Running dockerd inside a Sandbox makes disk and
+    image pulls part of the billed time, so pull once and keep the sandbox
+    for the whole test run instead of recreating it.
+    REQUIRES confirm=True. Cost: about $0.142 per core-hour plus $0.024 per
+    GiB-hour at Modal's published Sandbox rates (billed per second on the
+    higher of request and usage, so this is a floor): the refusal message
+    states the estimate for the exact shape requested -- relay it to the
+    user and get their go-ahead in this turn first."""
+    err = _require_vm_runtime()
+    if err:
+        return err
+    try:
+        cpu_cores = float(cpu_cores)
+        memory_mib = int(memory_mib)
+        timeout = int(timeout)
+        idle_timeout = int(idle_timeout)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "cpu_cores must be a number and memory_mib, timeout, idle_timeout integers."}
+    if not (MIN_HOST_CPU_CORES <= cpu_cores <= INFRA_MAX_CPU):
+        return {"ok": False, "error": f"cpu_cores={cpu_cores:g} is outside {MIN_HOST_CPU_CORES:g}-{INFRA_MAX_CPU:g}."}
+    if not (INFRA_MIN_MEMORY_MIB <= memory_mib <= INFRA_MAX_MEMORY_MIB):
+        return {"ok": False, "error": f"memory_mib={memory_mib} is outside "
+                                      f"{INFRA_MIN_MEMORY_MIB}-{INFRA_MAX_MEMORY_MIB}."}
+    if not (60 <= timeout <= INFRA_MAX_TIMEOUT):
+        return {"ok": False, "error": f"timeout={timeout} is outside 60-{INFRA_MAX_TIMEOUT} seconds."}
+    if idle_timeout < 30:
+        return {"ok": False, "error": "idle_timeout must be at least 30 seconds."}
+    ports = list(encrypted_ports or [])
+    if (len(ports) > INFRA_MAX_PORTS or len(set(ports)) != len(ports)
+            or any(not isinstance(p, int) or isinstance(p, bool) or not (1 <= p <= 65535) for p in ports)):
+        return {"ok": False, "error": f"encrypted_ports must be at most {INFRA_MAX_PORTS} distinct integers in 1-65535."}
+    extra = list(apt_packages or [])
+    bad = [p for p in extra if not isinstance(p, str) or not _APT_NAME.match(p)]
+    if bad:
+        return {"ok": False, "error": f"Invalid apt package name(s): {bad}. Use plain Ubuntu package names."}
+
+    hourly = _estimate_hourly_cost(cpu_cores, memory_mib)
+    if not confirm:
+        return _confirm_required(
+            f"create a {cpu_cores:g}-core, {memory_mib} MiB VM sandbox running Docker (about "
+            f"${hourly:.2f}/hour floor at Modal's published rates, up to "
+            f"${hourly * timeout / 3600:.2f} if it runs to its {timeout} s timeout)")
+
+    try:
+        app = modal.App.lookup(app_name, create_if_missing=True)
+        image = (modal.Image.from_registry(INFRA_BASE_IMAGE)
+                 .env({"DEBIAN_FRONTEND": "noninteractive"})
+                 .apt_install(*INFRA_APT_PACKAGES, *extra))
+        sandbox = modal.Sandbox.create(
+            "dockerd",
+            app=app,
+            image=image,
+            runtime="vm",
+            cpu=cpu_cores,
+            memory=memory_mib,
+            timeout=timeout,
+            idle_timeout=idle_timeout,
+            encrypted_ports=ports,
+            readiness_probe=modal.Probe.with_exec("docker", "info", interval_ms=500),
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to create the VM sandbox: {e}"}
+
+    try:
+        sandbox.wait_until_ready(timeout=INFRA_READY_TIMEOUT)
+    except Exception as e:
+        try:
+            sandbox.terminate(wait=True)
+        except Exception:
+            pass
+        return {"ok": False, "error": f"dockerd did not become ready within {INFRA_READY_TIMEOUT}s ({e}). "
+                                      f"The sandbox was terminated automatically rather than left billing."}
+
+    versions = {}
+    try:
+        for key, argv in (("docker", ["docker", "version", "--format", "{{.Server.Version}}"]),
+                          ("compose", ["docker", "compose", "version", "--short"])):
+            r = _exec_capture(sandbox, argv, 60)
+            versions[key] = r["stdout"] if r["returncode"] == 0 else f"unavailable: {r['stderr'][:120]}"
+    except Exception as e:
+        versions["error"] = f"{type(e).__name__}: {e}"
+
+    tunnels = {}
+    if ports:
+        try:
+            for port, tun in sandbox.tunnels().items():
+                tunnels[int(port)] = getattr(tun, "url", None)
+        except Exception as e:
+            tunnels = {"error": f"could not read tunnels: {type(e).__name__}: {e}"}
+
+    handle = _new_handle()
+    object_id = sandbox.object_id
+    _SANDBOXES[handle] = {
+        "sandbox": sandbox,
+        "object_id": object_id,
+        "gpu": f"NONE (vm runtime, cpu={cpu_cores:g} cores, memory={memory_mib} MiB, docker)",
+        "app_name": app_name,
+        "created": time.time(),
+    }
+    return {
+        "ok": True,
+        "handle": handle,
+        "object_id": object_id,
+        "runtime": "vm",
+        "cpu_cores": cpu_cores,
+        "memory_mib": memory_mib,
+        "versions": versions,
+        "tunnels": tunnels,
+        "estimated_hourly_cost_usd": round(hourly, 4),
+        "timeout": timeout,
+        "idle_timeout": idle_timeout,
+        "message": f"VM sandbox '{handle}' is live and billing now (about ${hourly:.2f}/hour floor). "
+                   f"Docker is ready. Call modal_terminate_sandbox('{handle}', confirm=True) when done; "
+                   f"object_id '{object_id}' lets you reconnect and terminate it if this server loses the handle.",
+    }
+
+
+@mcp.tool()
+def modal_upload_dir(
+    handle: str,
+    local_dir: str,
+    remote_dir: str,
+    exclude: Optional[list] = None,
+    include_secrets: bool = False,
+    max_mib: int = DEFAULT_UPLOAD_MAX_MIB,
+    timeout: int = 300,
+) -> dict:
+    """Upload a whole local directory (for example a compose project) into a
+    live sandbox as one compressed archive, then extract it at remote_dir.
+    Far fewer calls than modal_sync_files for a tree of files.
+    Safe by default: paths matching `.git`, `.venv`, `node_modules`,
+    `__pycache__`, caches, `.env`, `.env.local`, `.tls`, `*.pem`, `*.key` and
+    `*.sqlite` are NOT uploaded, symlinks are skipped, and the tree is refused
+    if it exceeds max_mib (default 256) after exclusions -- all checked before
+    anything leaves the machine. exclude: extra glob patterns (matched against
+    every path component and the whole relative path). include_secrets=True
+    additionally uploads the secret-like files (.env, .env.local, .tls, *.pem,
+    *.key) -- only with the user's explicit approval, since the sandbox is a
+    remote machine; generated secrets are better created inside the sandbox
+    (for example by running the project's own secrets script there)."""
+    entry, err = _get_sandbox(handle)
+    if err:
+        return err
+    if not remote_dir or not remote_dir.startswith("/"):
+        return {"ok": False, "error": "remote_dir must be an absolute path inside the sandbox."}
+    patterns = list(DEFAULT_UPLOAD_EXCLUDES) + list(exclude or [])
+    if include_secrets:
+        secret_like = {".env", ".env.local", ".tls", "*.pem", "*.key"}
+        patterns = [p for p in patterns if p not in secret_like]
+    try:
+        tar_path, files, total, skipped = _build_tarball(local_dir, patterns, int(max_mib) * 1024 * 1024)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    remote_tar = f"/tmp/upload-{_new_handle()}.tar.gz"
+    sandbox = entry["sandbox"]
+    try:
+        sandbox.filesystem.copy_from_local(tar_path, remote_tar)
+        q_dir, q_tar = shlex.quote(remote_dir), shlex.quote(remote_tar)
+        r = _exec_capture(sandbox, ["bash", "-c",
+                                    f"mkdir -p {q_dir} && tar -xzf {q_tar} -C {q_dir} && rm -f {q_tar}"],
+                          timeout)
+    except Exception as e:
+        return {"ok": False, "error": f"Upload failed: {type(e).__name__}: {e}"}
+    finally:
+        try:
+            os.remove(tar_path)
+        except OSError:
+            pass
+    if r["returncode"] != 0:
+        return {"ok": False, "error": f"Extraction failed: {r['stderr'][:300]}"}
+    return {
+        "ok": True,
+        "remote_dir": remote_dir,
+        "files": files,
+        "uncompressed_bytes": total,
+        "skipped_paths": skipped,
+        "excluded_patterns": patterns,
+        "secrets_included": include_secrets,
+    }
+
+
+@mcp.tool()
+def modal_docker_status(handle: str, timeout: int = 120) -> dict:
+    """One-call health picture of a Docker host sandbox (host_infra_sandbox):
+    every container with its state and health (`docker ps -a`), live memory
+    and CPU per running container (`docker stats --no-stream`), and the
+    machine's memory and disk. Use it between compose steps to see what is up,
+    what exited, and how close each service is to its memory limit before
+    deciding to raise the sandbox's memory or terminate it."""
+    entry, err = _get_sandbox(handle)
+    if err:
+        return err
+    sandbox = entry["sandbox"]
+
+    def jsonl(text: str) -> list:
+        rows = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        return rows
+
+    try:
+        ps = _exec_capture(sandbox, ["docker", "ps", "-a", "--format", "{{json .}}"], timeout)
+        if ps["returncode"] != 0:
+            return {"ok": False, "error": f"docker ps failed (is this a host_infra_sandbox?): {ps['stderr'][:300]}"}
+        stats = _exec_capture(sandbox, ["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout)
+        mem = _exec_capture(sandbox, ["free", "-m"], 30)
+        disk = _exec_capture(sandbox, ["df", "-h", "/", "/var/lib/docker"], 30)
+    except Exception as e:
+        return {"ok": False, "error": f"Status failed: {type(e).__name__}: {e}"}
+    containers = [{"name": c.get("Names"), "image": c.get("Image"), "status": c.get("Status"),
+                   "state": c.get("State")} for c in jsonl(ps["stdout"])]
+    usage = [{"name": s.get("Name"), "mem": s.get("MemUsage"), "mem_percent": s.get("MemPerc"),
+              "cpu_percent": s.get("CPUPerc")} for s in jsonl(stats["stdout"])]
+    return {
+        "ok": True,
+        "containers": containers,
+        "usage": usage,
+        "machine_memory": mem["stdout"],
+        "disk": disk["stdout"],
+    }
+
+
+@mcp.tool()
+def modal_sandbox_tunnels(handle: str, timeout: int = 50) -> dict:
+    """List the public tunnel URLs of a sandbox's exposed ports (created with
+    encrypted_ports): {port: url}. The URLs are reachable by anyone who has
+    them while the sandbox runs, so treat them as sensitive."""
+    entry, err = _get_sandbox(handle)
+    if err:
+        return err
+    try:
+        tunnels = entry["sandbox"].tunnels(timeout=int(timeout))
+    except Exception as e:
+        return {"ok": False, "error": f"Could not read tunnels: {type(e).__name__}: {e}"}
+    return {"ok": True, "tunnels": {int(p): getattr(t, "url", None) for p, t in tunnels.items()}}
+
+
+# ---------------------------------------------------------------------------
 # host_* tools -- purpose-built entry points for common resource shapes, so
 # an agent can pick the right one by name alone instead of juggling gpu/cpu
 # parameters on one generic tool. Each one boots a Jupyter-capable sandbox
@@ -1449,6 +1910,7 @@ def host_cpu_sandbox(
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
     app_name: str = DEFAULT_APP_NAME,
     confirm: bool = False,
+    memory_mib: Optional[int] = None,
 ) -> dict:
     """Create a live, billable, GPU-FREE Modal sandbox with a flexible
     number of CPU cores, and connect a Jupyter kernel to it -- for
@@ -1467,10 +1929,19 @@ def host_cpu_sandbox(
     Notebooks CPU rate is roughly $0.14/core/hr as of this writing (check
     https://modal.com/pricing for the live rate); state the resulting
     core count and approximate hourly cost to the user and get their
-    go-ahead in this turn first."""
+    go-ahead in this turn first.
+    memory_mib: optional memory request in MiB (Modal's default is only 128
+    MiB; pass e.g. 4096 for a 4 GiB workload). Memory is billed at roughly
+    $0.024 per GiB-hour on top of the CPU rate, and the cost estimate in the
+    confirm message includes it. Leave None to keep Modal's default.
+    This preset runs on the default (gVisor) runtime and CANNOT run Docker:
+    use host_infra_sandbox for Docker or Compose workloads."""
     err = _require_modal() or _require_websocket_client()
     if err:
         return err
+    if memory_mib is not None and not (128 <= int(memory_mib) <= INFRA_MAX_MEMORY_MIB):
+        return {"ok": False, "error": f"memory_mib={memory_mib} is outside the allowed "
+                                      f"128-{INFRA_MAX_MEMORY_MIB} MiB range."}
     cpu_cores = scaling_factor * CPU_BASE_CORES
     if cpu_cores < MIN_HOST_CPU_CORES or cpu_cores > MAX_HOST_CPU_CORES:
         return {
@@ -1481,18 +1952,24 @@ def host_cpu_sandbox(
                      f"scaling_factor between {MIN_HOST_CPU_CORES / CPU_BASE_CORES:g} and "
                      f"{MAX_HOST_CPU_CORES / CPU_BASE_CORES:g}.",
         }
+    est_mem = int(memory_mib) if memory_mib is not None else 128  # Modal's default request
     if not confirm:
-        return _confirm_required(f"create a {cpu_cores:g}-core CPU sandbox (billed per second while it runs)")
+        return _confirm_required(
+            f"create a {cpu_cores:g}-core, {est_mem} MiB CPU sandbox (about "
+            f"${_estimate_hourly_cost(cpu_cores, est_mem):.2f}/hour at Modal's published rates, "
+            f"billed per second while it runs)")
 
     sandbox, kernel, server_url, token = _boot_jupyter_sandbox(
-        None, pip_packages, app_name, timeout, idle_timeout, cpu=cpu_cores
+        None, pip_packages, app_name, timeout, idle_timeout, cpu=cpu_cores,
+        memory=int(memory_mib) if memory_mib is not None else None,
     )
     if sandbox is None:
         return server_url  # error dict in the failure case
 
+    mem_label = f", memory={int(memory_mib)} MiB" if memory_mib is not None else ""
     return _register_jupyter_sandbox(
         sandbox, kernel, server_url, token,
-        gpu_label=f"NONE (cpu={cpu_cores:g} cores)",
+        gpu_label=f"NONE (cpu={cpu_cores:g} cores{mem_label})",
         app_name=app_name, timeout=timeout, idle_timeout=idle_timeout,
     )
 
