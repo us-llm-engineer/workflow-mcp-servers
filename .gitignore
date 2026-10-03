@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!*.env.example
+.http_env
+config.json
+google_tokens.json
+oauth_clients.json
+*.log

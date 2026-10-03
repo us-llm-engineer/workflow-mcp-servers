@@ -1,0 +1,12 @@
+# Append to ~/.codex/config.toml
+[mcp_servers.codex-opencode-bridge]
+command = "node"
+args = ["/ABSOLUTE/PATH/TO/workflow-mcp-servers/codex-opencode-bridge/dist/index.js"]
+
+[mcp_servers.modal-gpu]
+command = "python3"
+args = ["/ABSOLUTE/PATH/TO/workflow-mcp-servers/modal-gpu/modal_server.py"]
+
+[mcp_servers.colab-proxy-mcp]
+command = "uv"
+args = ["run", "--directory", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/colab-proxy-mcp", "colab-mcp"]

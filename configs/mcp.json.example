@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "codex-opencode-bridge": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/workflow-mcp-servers/codex-opencode-bridge/dist/index.js"]
+    },
+    "colab-proxy-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/colab-proxy-mcp", "colab-mcp"]
+    },
+    "modal-gpu": {
+      "command": "python3",
+      "args": ["/ABSOLUTE/PATH/TO/workflow-mcp-servers/modal-gpu/modal_server.py"]
+    },
+    "scopus-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/scopus-mcp", "python", "-m", "scopus_mcp.server"],
+      "env": { "SCOPUS_API_KEY": "<your Elsevier API key>" }
+    },
+    "data-host-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:8791/mcp"
+    }
+  }
+}

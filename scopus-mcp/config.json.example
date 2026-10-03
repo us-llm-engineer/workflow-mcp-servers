@@ -1,0 +1,7 @@
+{
+  "api_key": "YOUR_SCOPUS_API_KEY_HERE",
+  "cache_ttl_search": 3600,
+  "cache_ttl_abstract": 2592000,
+  "cache_ttl_author": 604800,
+  "cache_ttl_default": 86400
+}

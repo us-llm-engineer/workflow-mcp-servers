@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "scopus-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/scopus-mcp",
+        "python",
+        "-m",
+        "scopus_mcp.server"
+      ]
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Install as ~/.config/systemd/user/data-host-mcp.service, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now data-host-mcp
+[Unit]
+Description=data-host-mcp (OneDrive + Google Drive MCP server, OAuth-protected HTTP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /ABSOLUTE/PATH/TO/workflow-mcp-servers/data-host-mcp/server.py
+Restart=on-failure
+RestartSec=3
+Environment=AZURE_APPLICATION_ID=<your Azure application (client) id>
+Environment=AZURE_ENV_PATH=/ABSOLUTE/PATH/TO/data-host-mcp.env
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+{
+  "mcp": {
+    "codex-opencode-bridge": {
+      "type": "local",
+      "command": ["node", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/codex-opencode-bridge/dist/index.js"],
+      "enabled": true
+    },
+    "modal-gpu": {
+      "type": "local",
+      "command": ["python3", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/modal-gpu/modal_server.py"],
+      "enabled": true
+    },
+    "colab-proxy-mcp": {
+      "type": "local",
+      "command": ["uv", "run", "--directory", "/ABSOLUTE/PATH/TO/workflow-mcp-servers/colab-proxy-mcp", "colab-mcp"],
+      "enabled": true
+    }
+  }
+}
